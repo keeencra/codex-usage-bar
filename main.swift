@@ -518,10 +518,156 @@ final class CodexUsageReader {
     }
 }
 
+struct DeepSeekBalance: Decodable {
+    struct Entry: Decodable {
+        let currency: String
+        let total_balance: String
+        let granted_balance: String
+        let topped_up_balance: String
+        var display: String {
+            let symbol = currency == "CNY" ? "¥" : (currency == "USD" ? "$" : currency + " ")
+            return symbol + total_balance
+        }
+    }
+    let is_available: Bool
+    let balance_infos: [Entry]
+}
+
+final class DeepSeekBalanceReader {
+    func read(completion: @escaping (DeepSeekBalance?, String?) -> Void) {
+        let file = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".codex/secrets/deepseek-api-key")
+        let key = (ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"]
+            ?? (try? String(contentsOf: file, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { completion(nil, "未配置 API Key"); return }
+        var request = URLRequest(url: URL(string: "https://api.deepseek.com/user/balance")!)
+        request.timeoutInterval = 12
+        request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        let session = URLSession(configuration: config)
+        session.dataTask(with: request) { data, response, error in
+            defer { session.finishTasksAndInvalidate() }
+            guard error == nil else { completion(nil, "网络连接失败"); return }
+            guard let http = response as? HTTPURLResponse else { completion(nil, "响应无效"); return }
+            guard http.statusCode == 200 else {
+                completion(nil, http.statusCode == 401 ? "API Key 无效" : "查询失败（HTTP \(http.statusCode)）")
+                return
+            }
+            guard let data, let balance = try? JSONDecoder().decode(DeepSeekBalance.self, from: data),
+                  !balance.balance_infos.isEmpty else { completion(nil, "余额数据无效"); return }
+            completion(balance, nil)
+        }.resume()
+    }
+}
+
+final class QuotaDashboardView: NSView {
+    let snapshot: AppSnapshot
+    let balance: DeepSeekBalance?
+    let balanceError: String?
+    let balanceDate: Date?
+    private let ink = NSColor(calibratedWhite: 0.94, alpha: 1)
+    private let muted = NSColor(calibratedRed: 0.54, green: 0.60, blue: 0.69, alpha: 1)
+    private let purple = NSColor(calibratedRed: 0.63, green: 0.57, blue: 1, alpha: 1)
+    private let teal = NSColor(calibratedRed: 0.35, green: 0.83, blue: 0.79, alpha: 1)
+    override var isFlipped: Bool { true }
+    init(snapshot: AppSnapshot, balance: DeepSeekBalance?, error: String?, date: Date?) {
+        self.snapshot = snapshot; self.balance = balance; balanceError = error; balanceDate = date
+        let rows = max(1, snapshot.accountUsage?.windows.count ?? 0)
+        let currencies = max(1, balance?.balance_infos.count ?? 0)
+        super.init(frame: NSRect(x: 0, y: 0, width: 368, height: 352 + rows * 70 + currencies * 62))
+        setAccessibilityElement(true)
+        setAccessibilityLabel("AI 额度概览。完整数值可在用量与任务详情菜单中查看。")
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    private func text(_ value: String, x: CGFloat, y: CGFloat, width: CGFloat = 310, size: CGFloat = 12,
+                      color: NSColor? = nil, weight: NSFont.Weight = .regular, mono: Bool = false) {
+        let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingTail
+        (value as NSString).draw(in: NSRect(x: x, y: y, width: width, height: size + 7), withAttributes: [
+            .font: mono ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight),
+            .foregroundColor: color ?? ink, .paragraphStyle: paragraph
+        ])
+    }
+    private func card(y: CGFloat, height: CGFloat) {
+        let path = NSBezierPath(roundedRect: NSRect(x: 14, y: y, width: 340, height: height), xRadius: 13, yRadius: 13)
+        NSColor(calibratedRed: 0.065, green: 0.09, blue: 0.135, alpha: 1).setFill(); path.fill()
+        NSColor(calibratedWhite: 1, alpha: 0.09).setStroke(); path.lineWidth = 1; path.stroke()
+    }
+    private func stamp(_ date: Date?) -> String {
+        guard let date else { return "待更新" }
+        let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"; return formatter.string(from: date)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedRed: 0.035, green: 0.052, blue: 0.083, alpha: 1).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 0), xRadius: 14, yRadius: 14).fill()
+        text("AI 额度", x: 24, y: 18, size: 19, weight: .bold)
+        text("USAGE MONITOR", x: 24, y: 46, size: 9, color: muted, weight: .medium)
+        text("每 60 秒刷新", x: 250, y: 24, width: 95, size: 10, color: muted)
+        var y: CGFloat = 76
+        let windows = snapshot.accountUsage?.windows ?? []
+        let ch = CGFloat(72 + max(1, windows.count) * 70)
+        card(y: y, height: ch)
+        text("◈", x: 28, y: y + 15, size: 20, color: purple)
+        text("Codex", x: 56, y: y + 18, size: 14, weight: .semibold)
+        let plan = snapshot.accountUsage?.planType == "prolite" ? "Pro" : (snapshot.accountUsage?.planLabel ?? "—")
+        text(plan, x: 275, y: y + 19, width: 60, size: 11, color: purple, weight: .semibold)
+        var row = y + 52
+        if windows.isEmpty { text("额度暂不可用", x: 28, y: row, color: muted) }
+        for window in windows {
+            let label = window.windowLabel == "1周" ? "周额度" : (window.windowLabel == "5小时" ? "5h 额度" : window.windowLabel)
+            text(label, x: 28, y: row, size: 11, color: muted)
+            text("\(window.remainingPercent)% 剩余", x: 238, y: row - 2, width: 102, size: 14, weight: .semibold, mono: true)
+            let tint = window.remainingPercent <= 10 ? NSColor.systemRed : (window.remainingPercent <= 50 ? NSColor.systemOrange : purple)
+            for index in 0..<24 {
+                let segment = NSBezierPath(roundedRect: NSRect(x: 28 + CGFloat(index) * 13, y: row + 25, width: 10, height: 5), xRadius: 1.5, yRadius: 1.5)
+                let fraction = max(0, min(1, CGFloat(window.remainingPercent) / 100 * 24 - CGFloat(index)))
+                tint.withAlphaComponent(0.12).setFill(); segment.fill()
+                if fraction > 0 {
+                    tint.setFill()
+                    NSBezierPath(roundedRect: NSRect(x: 28 + CGFloat(index) * 13, y: row + 25, width: 10 * fraction, height: 5), xRadius: 1, yRadius: 1).fill()
+                }
+            }
+            text("重置  " + stamp(window.resetsAt), x: 28, y: row + 38, size: 10, color: muted)
+            row += 70
+        }
+        let state = snapshot.accountError == nil ? "已更新 " + stamp(snapshot.accountUsage?.lastSuccessAt) : "缓存数据 · 暂未连接"
+        text(state, x: 28, y: y + ch - 20, size: 9, color: muted)
+        y += ch + 12
+        let dh = CGFloat(62 + max(1, balance?.balance_infos.count ?? 0) * 62)
+        card(y: y, height: dh)
+        text("◉", x: 28, y: y + 15, size: 19, color: teal)
+        text("DeepSeek", x: 56, y: y + 18, size: 14, weight: .semibold)
+        text(balance == nil ? "未连接" : (balance!.is_available ? "可用" : "余额不足"), x: 276, y: y + 20, width: 65, size: 10, color: balance?.is_available == false ? .systemOrange : teal)
+        row = y + 48
+        if let balance {
+            for entry in balance.balance_infos {
+                text(entry.display, x: 28, y: row, size: 24, weight: .semibold, mono: true)
+                text(entry.currency, x: 287, y: row + 9, width: 50, size: 10, color: muted)
+                text("充值 \(entry.topped_up_balance)  ·  赠送 \(entry.granted_balance)", x: 28, y: row + 33, size: 10, color: muted)
+                row += 62
+            }
+        } else { text(balanceError ?? "正在查询余额", x: 28, y: row + 5, color: muted) }
+        y += dh + 12
+        card(y: y, height: 70)
+        text("最近任务用量", x: 28, y: y + 14, size: 11, color: muted)
+        let tokens = snapshot.threadUsage.totalRecentTokens
+        let count = tokens >= 1_000_000 ? String(format: "%.2fM", Double(tokens) / 1_000_000) : (tokens >= 1000 ? String(format: "%.1fK", Double(tokens) / 1000) : String(tokens))
+        text(count + " tokens", x: 28, y: y + 33, size: 18, weight: .semibold, mono: true)
+        text("最近 8 个任务", x: 243, y: y + 38, width: 96, size: 10, color: muted)
+        text("本机读取  ·  DeepSeek " + stamp(balanceDate), x: 24, y: y + 85, size: 9, color: muted)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let accountReader = AccountUsageReader()
     private let reader = CodexUsageReader()
+    private let deepSeekReader = DeepSeekBalanceReader()
+    private var deepSeekBalance: DeepSeekBalance?
+    private var deepSeekError: String? = "正在查询"
+    private var deepSeekUpdatedAt: Date?
+    private var latestSnapshot: AppSnapshot?
+    private var deepSeekLoading = false
     private var timer: Timer?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -535,6 +681,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
+        if !deepSeekLoading {
+            deepSeekLoading = true
+            deepSeekReader.read { [weak self] balance, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.deepSeekLoading = false
+                    self.deepSeekBalance = balance
+                    self.deepSeekError = error
+                    self.deepSeekUpdatedAt = balance == nil ? nil : Date()
+                    if let snapshot = self.latestSnapshot {
+                        self.updateTitle(snapshot)
+                        self.updateMenu(snapshot)
+                    }
+                }
+            }
+        }
         DispatchQueue.global(qos: .utility).async {
             let threadUsage = self.reader.read()
             let account = self.accountReader.read()
@@ -546,6 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 accountError: account.1
             )
             DispatchQueue.main.async {
+                self.latestSnapshot = snapshot
                 self.updateTitle(snapshot)
                 self.updateMenu(snapshot)
             }
@@ -553,6 +716,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateTitle(_ snapshot: AppSnapshot) {
+        defer {
+            if let button = statusItem.button {
+                let title = NSMutableAttributedString(attributedString: button.attributedTitle)
+                let amount = deepSeekBalance?.balance_infos.map { $0.display }.joined(separator: " / ") ?? "—"
+                title.append(NSAttributedString(string: "   |   DeepSeek " + amount, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+                ]))
+                button.attributedTitle = title
+                button.toolTip = (button.toolTip ?? "Codex") + " · DeepSeek " + (deepSeekError ?? amount)
+            }
+        }
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         if let accountUsage = snapshot.accountUsage {
             let shortRemaining = accountUsage.shortWindow?.remainingPercent
@@ -595,6 +769,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenu(_ snapshot: AppSnapshot) {
         let menu = NSMenu()
+        menu.addItem(disabled("DeepSeek · 官方 API"))
+        if let balance = deepSeekBalance {
+            for entry in balance.balance_infos {
+                menu.addItem(disabled("余额：\(entry.display)（\(entry.currency)）"))
+                menu.addItem(disabled("充值：\(entry.topped_up_balance) · 赠送：\(entry.granted_balance)"))
+            }
+            menu.addItem(disabled(balance.is_available ? "状态：可用" : "状态：余额不足"))
+            if let date = deepSeekUpdatedAt {
+                menu.addItem(disabled("更新：\(timeFormatter.string(from: date))"))
+            }
+        } else {
+            menu.addItem(disabled(deepSeekError ?? "正在查询"))
+        }
+        menu.addItem(.separator())
 
         if let accountUsage = snapshot.accountUsage {
             menu.addItem(disabled("剩余用量"))
@@ -652,15 +840,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        menu.addItem(.separator())
+        let rootMenu = NSMenu()
+        rootMenu.appearance = NSAppearance(named: .darkAqua)
+        menu.appearance = NSAppearance(named: .darkAqua)
+        let overview = NSMenuItem()
+        overview.view = QuotaDashboardView(snapshot: snapshot, balance: deepSeekBalance, error: deepSeekError, date: deepSeekUpdatedAt)
+        rootMenu.addItem(overview)
+        let details = NSMenuItem(title: "用量与任务详情", action: nil, keyEquivalent: "")
+        details.submenu = menu
+        rootMenu.addItem(details)
+        rootMenu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "刷新", action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
-        menu.addItem(refreshItem)
+        rootMenu.addItem(refreshItem)
         let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
-        menu.addItem(quitItem)
+        rootMenu.addItem(quitItem)
 
-        statusItem.menu = menu
+        statusItem.menu = rootMenu
     }
 
     @objc private func manualRefresh() {
